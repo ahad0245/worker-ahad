@@ -1,46 +1,77 @@
-// api/bulk-sync.js  (for Vercel)  OR  pages/api/bulk-sync.js (for Next.js)
+// api/location-bulk-sync.js  (for Vercel standalone)
+// or pages/api/location-bulk-sync.js (for Next.js)
 
-const MAIN_API_BASE_URL = process.env.MAIN_API_BASE_URL; // e.g. https://your-main-api.com
-const MAIN_API_KEY = process.env.MAIN_API_KEY;           // if you use auth
+/**
+ * ENV:
+ *  MAIN_API_BASE_URL = https://your-main-api-domain.com
+ *  MAIN_API_KEY      = optional bearer token
+ */
 
-// ✅ Your custom rule/check per record
-function customCheck(record) {
-  // --------- EXAMPLES (edit these to your logic) ----------
-  // Skip if required field is missing
-  if (!record.userId) return false;
+const MAIN_API_BASE_URL = process.env.MAIN_API_BASE_URL;
+const MAIN_API_KEY = process.env.MAIN_API_KEY;
 
-  // Skip if value is 0 or negative
-  if (record.total !== undefined && record.total <= 0) return false;
+// ---------- Custom checks for each record ----------
+function customCheckLocationPayload(payload) {
+  if (!payload) return false;
 
-  // Add any other business rules here...
-  // e.g. if (record.status === 'draft') return false;
+  // Required fields based on your example
+  if (!payload.id) return false;
+  if (!payload.locationId) return false;
+
+  if (
+    typeof payload.latitude !== 'number' ||
+    typeof payload.longitude !== 'number'
+  ) {
+    return false;
+  }
+
+  // Avoid garbage coordinates
+  if (payload.latitude === 0 && payload.longitude === 0) return false;
+
+  // Optional: if startTime is required (you can relax this if needed)
+  if (!payload.startTime) return false;
 
   return true;
 }
 
-// ✅ Function that sends one record to your main API
-async function sendToMainApi(record) {
-  // Change this path to your actual endpoint
-  const url = `${MAIN_API_BASE_URL}/api/v1/your-endpoint`;
+// ---------- Call your main API: /api/v1/tracker/updateLocations ----------
+async function sendToUpdateLocations(payload) {
+  if (!MAIN_API_BASE_URL) {
+    throw new Error('MAIN_API_BASE_URL is not configured on worker');
+  }
+
+  const url = `${MAIN_API_BASE_URL}/api/v1/tracker/updateLocations`;
 
   const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(MAIN_API_KEY ? { 'Authorization': `Bearer ${MAIN_API_KEY}` } : {})
+      ...(MAIN_API_KEY ? { Authorization: `Bearer ${MAIN_API_KEY}` } : {})
     },
-    body: JSON.stringify(record)
+    body: JSON.stringify(payload)
   });
 
+  const text = await res.text().catch(() => '');
+
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Main API error ${res.status}: ${text || res.statusText}`);
+    throw new Error(
+      `Main API ${res.status} on updateLocations: ${
+        text || res.statusText || 'Unknown error'
+      }`
+    );
   }
 
-  const json = await res.json().catch(() => ({}));
+  let json = {};
+  try {
+    json = JSON.parse(text || '{}');
+  } catch {
+    json = {};
+  }
+
   return json;
 }
 
+// ---------- Vercel Handler ----------
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -48,21 +79,25 @@ export default async function handler(req, res) {
   }
 
   try {
+    if (!MAIN_API_BASE_URL) {
+      return res
+        .status(500)
+        .json({ message: 'MAIN_API_BASE_URL env is required on worker' });
+    }
+
     const { deviceId, records } = req.body || {};
 
     if (!Array.isArray(records) || records.length === 0) {
-      return res.status(400).json({ message: 'records must be a non-empty array' });
+      return res
+        .status(400)
+        .json({ message: 'records must be a non-empty array' });
     }
 
-    if (!MAIN_API_BASE_URL) {
-      return res.status(500).json({ message: 'MAIN_API_BASE_URL is not configured on worker' });
-    }
-
-    // Optional: limit batch size per request so Vercel doesn’t timeout
-    const MAX_PER_CALL = 100;
+    // Limit per call so Vercel doesn’t time out
+    const MAX_PER_CALL = 200;
     if (records.length > MAX_PER_CALL) {
       return res.status(400).json({
-        message: `Too many records at once. Max ${MAX_PER_CALL}`,
+        message: `Too many records in one call. Max ${MAX_PER_CALL}.`,
         received: records.length
       });
     }
@@ -72,38 +107,60 @@ export default async function handler(req, res) {
     let skippedCount = 0;
     let errorCount = 0;
 
-    for (const record of records) {
-      const payload = {
-        deviceId: deviceId || null,
-        ...record
+    for (const row of records) {
+      const rowId = row.id;
+      let payload = row.payload;
+
+      // If payload accidentally comes as string, try to parse
+      if (payload && typeof payload === 'string') {
+        try {
+          payload = JSON.parse(payload);
+        } catch (e) {
+          results.push({
+            rowId,
+            status: 'error',
+            error: 'Invalid JSON in payload',
+            rawPayload: row.payload
+          });
+          errorCount++;
+          continue;
+        }
+      }
+
+      // Attach deviceId if needed for tracing
+      const finalPayload = {
+        ...(payload || {}),
+        deviceId: deviceId || payload?.deviceId || null
       };
 
-      // 1) Run your custom business check
-      if (!customCheck(payload)) {
+      // 1) Run custom check
+      if (!customCheckLocationPayload(finalPayload)) {
         results.push({
+          rowId,
           status: 'skipped',
-          reason: 'customCheck_failed',
-          record
+          reason: 'customCheck_failed'
         });
         skippedCount++;
         continue;
       }
 
-      // 2) Send to main API one-by-one
+      // 2) Call main API for this one record
       try {
-        const mainResponse = await sendToMainApi(payload);
+        const apiResponse = await sendToUpdateLocations(finalPayload);
+
         results.push({
+          rowId,
           status: 'success',
-          record,
-          mainResponse
+          apiResponse
         });
         successCount++;
       } catch (err) {
-        console.error('Error sending to main API:', err.message);
+        console.error('Error sending to main API for row', rowId, err.message);
+
         results.push({
+          rowId,
           status: 'error',
-          error: err.message,
-          record
+          error: err.message
         });
         errorCount++;
       }
@@ -118,7 +175,7 @@ export default async function handler(req, res) {
       results
     });
   } catch (err) {
-    console.error('bulk-sync worker error:', err);
+    console.error('location-bulk-sync worker error:', err);
     return res.status(500).json({
       message: 'Unexpected error in worker',
       error: err.message
